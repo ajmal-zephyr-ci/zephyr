@@ -7,7 +7,7 @@ name: Weekly Promotion (next to main)
 
 on:
   schedule:
-    - cron: '*/30 * * * *'    # Monday 02:00 IST
+    - cron: '*/5 * * * *'    # Monday 02:00 IST
   workflow_dispatch:
 
 permissions:
