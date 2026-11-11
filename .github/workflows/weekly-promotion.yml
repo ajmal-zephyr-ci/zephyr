@@ -1,0 +1,122 @@
+name: Weekly Promotion
+
+# Every Monday: open (or reuse) a PR next -> main, point a candidate branch at
+# next, tell Jenkins (no token), wait for the promotion job's result (Jenkins
+# applies PASS_THRESHOLD), and merge the PR only if Jenkins passed.
+# Uses only the built-in GITHUB_TOKEN that GitHub gives every workflow run.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'    # Monday 02:00 IST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: weekly-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Test and promote next to main
+    runs-on: [self-hosted, linux, x64, jenkins-internal]
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      JENKINS_JOB: ${{ vars.JENKINS_PROMOTION_JOB || 'promotion-mspm0g3519' }}
+      NEXT_BRANCH: ${{ vars.NEXT_BRANCH || 'v4.4.0-ti-next' }}
+      MAIN_BRANCH: ${{ vars.MAIN_BRANCH || 'v4.4.0-ti' }}
+      CANDIDATE: promotion/candidate
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Prepare, test, and merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          # wait_for_jenkins <job> <commit-sha> <max-minutes>
+          # Finds the Jenkins build that tested <commit-sha>, waits for it to finish,
+          # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.
+          # Uses only anonymous read access to Jenkins (no token).
+          wait_for_jenkins() {
+            local job="$1" sha="$2" max_min="$3" api build result url line
+            api="${JENKINS_URL%/}/job/${job}/api/json?tree=builds%5Bnumber,result,building,url,actions%5BlastBuiltRevision%5BSHA1%5D%5D%5D%7B0,40%7D"
+            for _ in $(seq 1 $((max_min * 2))); do
+              build=$(curl -sf "$api" | jq -c --arg s "$sha" \
+                '[.builds[] | select(any(.actions[]?; .lastBuiltRevision.SHA1? == $s))] | first // empty') || build=""
+              if [[ -n "$build" ]]; then
+                url=$(echo "$build" | jq -r .url)
+                if [[ "$(echo "$build" | jq -r .building)" == "false" ]]; then
+                  result=$(echo "$build" | jq -r .result)
+                  line=$(curl -sf "${url}consoleText" | grep -m1 '^RESULT:' || true)
+                  echo "Jenkins build: $url"
+                  echo "Jenkins result: $result"
+                  echo "${line:-RESULT: (no pass-rate line in log)}"
+                  { echo "### Jenkins $job: $result"; echo "${line:-}"; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+                  [[ "$result" == "SUCCESS" ]]
+                  return
+                fi
+                echo "Jenkins build running: $url"
+              else
+                echo "Waiting for Jenkins to start a build of $job for commit ${sha:0:12}..."
+              fi
+              sleep 30
+            done
+            echo "ERROR: no finished Jenkins build of $job for ${sha:0:12} within $max_min minutes"
+            return 1
+          }
+
+          [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
+          for tool in gh jq curl; do command -v "$tool" >/dev/null || { echo "ERROR: $tool missing"; exit 1; }; done
+
+          # 1. Anything to promote?
+          AHEAD=$(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" -q .ahead_by)
+          if [[ "$AHEAD" == "0" ]]; then
+            echo "$NEXT_BRANCH has nothing new for $MAIN_BRANCH - nothing to promote"
+            echo "### Nothing to promote this week" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          SHA=$(gh api "repos/$REPO/branches/$NEXT_BRANCH" -q .commit.sha)
+          WEEK=$(date +%G-W%V)
+          echo "Promoting $NEXT_BRANCH ($AHEAD commits, ${SHA:0:12}) into $MAIN_BRANCH for $WEEK"
+
+          # 2. Point the candidate branch at next (the promotion Jenkins job watches it)
+          if gh api "repos/$REPO/git/ref/heads/$CANDIDATE" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$CANDIDATE" -f sha="$SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$CANDIDATE" -f sha="$SHA" >/dev/null
+          fi
+
+          # 3. Open the promotion PR (or reuse the open one)
+          PR=$(gh pr list -R "$REPO" --base "$MAIN_BRANCH" --head "$NEXT_BRANCH" --state open --json number -q '.[0].number')
+          if [[ -z "$PR" ]]; then
+            gh pr create -R "$REPO" --base "$MAIN_BRANCH" --head "$NEXT_BRANCH" \
+              --title "Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH" \
+              --body "Automatic weekly promotion. Merged only if the Jenkins board tests reach the configured pass threshold."
+            PR=$(gh pr list -R "$REPO" --base "$MAIN_BRANCH" --head "$NEXT_BRANCH" --state open --json number -q '.[0].number')
+          fi
+          echo "Promotion PR: #$PR"
+
+          # 4. Tell Jenkins (no token), then wait for its verdict on this exact commit
+          REPO_URL="https://github.com/$REPO"
+          PAYLOAD=$(jq -n --arg u "$REPO_URL" '{repository:{url:$u,html_url:$u,clone_url:($u+".git")},pusher:{name:"github-actions"}}')
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${JENKINS_URL%/}/github-webhook/" \
+            -H "Content-Type: application/json" -H "X-GitHub-Event: push" --data "$PAYLOAD")
+          echo "Jenkins notified: HTTP $CODE"
+          [[ "$CODE" == "200" ]] || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
+
+          if OUT=$(wait_for_jenkins "$JENKINS_JOB" "$SHA" 330); then
+            echo "$OUT"
+            gh pr comment "$PR" -R "$REPO" --body "Jenkins board tests passed. Merging.
+          $(echo "$OUT" | grep '^RESULT:' || true)"
+            gh pr merge "$PR" -R "$REPO" --merge
+            echo "### Promotion $WEEK merged (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$OUT"
+            gh pr comment "$PR" -R "$REPO" --body "Jenkins board tests did not reach the pass threshold. Not merged.
+          $(echo "$OUT" | grep -E '^(RESULT|Jenkins)' || true)"
+            echo "### Promotion $WEEK NOT merged (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

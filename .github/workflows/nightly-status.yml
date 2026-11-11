@@ -1,0 +1,45 @@
+name: Nightly Board Tests
+
+# Jenkins runs the nightly jobs on its own timer (Build periodically).
+# Each morning this workflow reads their latest results (read-only, no token)
+# and fails if any job failed its PASS_THRESHOLD or did not run last night.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'     # 06:00 IST every day
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nightly:
+    name: Nightly results
+    runs-on: [self-hosted, linux, x64, jenkins-internal]
+    timeout-minutes: 10
+    env:
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      NIGHTLY_JOBS: ${{ vars.JENKINS_NIGHTLY_JOBS || 'nightly-mspm0g3519' }}
+      MAX_AGE_HOURS: ${{ vars.NIGHTLY_MAX_AGE_HOURS || '26' }}
+    steps:
+      - name: Read nightly results from Jenkins
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
+          FAILED=0
+          echo "### Nightly board tests" >> "$GITHUB_STEP_SUMMARY"
+          for job in $NIGHTLY_JOBS; do
+            B=$(curl -sf "${JENKINS_URL%/}/job/$job/lastCompletedBuild/api/json?tree=number,result,timestamp,url" || echo '{}')
+            RESULT=$(echo "$B" | jq -r '.result // "NONE"')
+            URL=$(echo "$B" | jq -r '.url // ""')
+            AGE_H=$(( ( $(date +%s) - $(echo "$B" | jq -r '(.timestamp // 0) / 1000 | floor') ) / 3600 ))
+            LINE=""
+            [[ -n "$URL" ]] && LINE=$(curl -sf "${URL}consoleText" | grep -m1 '^RESULT:' || true)
+            STATE="$RESULT"
+            if [[ "$RESULT" != "SUCCESS" ]]; then FAILED=1; fi
+            if (( AGE_H > MAX_AGE_HOURS )); then STATE="$RESULT (STALE: ${AGE_H}h old)"; FAILED=1; fi
+            echo "$job: $STATE  ${LINE}"
+            echo "- $job: $STATE ${LINE}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit $FAILED
