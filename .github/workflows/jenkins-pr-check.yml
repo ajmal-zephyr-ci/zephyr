@@ -19,8 +19,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+    name: Check PR is allowed
+    runs-on: [self-hosted, linux, x64, jenkins-internal]
+    timeout-minutes: 5
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    env:
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      JENKINS_JOB: ${{ vars.JENKINS_PR_JOB || 'pr-mspm0g3519' }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      PR_ROLE: ${{ github.event.pull_request.author_association }}
+      PR_BASE: ${{ github.event.pull_request.base.ref }}
+    steps:
+      - name: Read allowed authors and target branch from the Jenkins job
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
+          # Single source of truth: the Jenkins job's parameter defaults
+          # (ALLOWED_PR_AUTHORS, PR_TARGET_BRANCH), read without a token.
+          PARAMS=$(curl -sf "${JENKINS_URL%/}/job/${JENKINS_JOB}/api/json?tree=property%5BparameterDefinitions%5Bname,defaultParameterValue%5Bvalue%5D%5D%5D") \
+            || { echo "ERROR: cannot read Jenkins job $JENKINS_JOB"; exit 1; }
+          param() { echo "$PARAMS" | jq -r --arg n "$1" '[.property[]?.parameterDefinitions[]? | select(.name == $n) | .defaultParameterValue.value][0] // empty'; }
+          ALLOWED_USERS=$(param ALLOWED_PR_AUTHORS)
+          TARGET=$(param PR_TARGET_BRANCH)
+          TARGET="${TARGET:-v4.4.0-ti-next}"
+          echo "PR author: $PR_AUTHOR ($PR_ROLE), into: $PR_BASE"
+          echo "Jenkins settings: target=$TARGET allowed authors='${ALLOWED_USERS}'"
+
+          ALLOWED=false; REASON=""
+          if [[ "$PR_BASE" != "$TARGET" ]]; then
+            REASON="PR targets $PR_BASE, Jenkins job tests $TARGET"
+          elif [[ "$PR_ROLE" == "OWNER" || "$PR_ROLE" == "MEMBER" ]]; then
+            ALLOWED=true
+          else
+            for u in $ALLOWED_USERS; do [[ "$u" == "$PR_AUTHOR" ]] && ALLOWED=true; done
+            [[ "$ALLOWED" == true ]] || REASON="author $PR_AUTHOR ($PR_ROLE) is not in ALLOWED_PR_AUTHORS"
+          fi
+
+          echo "allowed=$ALLOWED" >> "$GITHUB_OUTPUT"
+          if [[ "$ALLOWED" == true ]]; then
+            echo "Allowed - board tests will run"
+            echo "### PR allowed - board tests will run" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "NOT allowed - board tests skipped: $REASON"
+            echo "### Board tests skipped: $REASON" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   board-test:
     name: Jenkins board test
+    needs: gate
+    if: needs.gate.outputs.allowed == 'true'
     runs-on: [self-hosted, linux, x64, jenkins-internal]
     timeout-minutes: 360
     env:
