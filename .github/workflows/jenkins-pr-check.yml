@@ -1,0 +1,80 @@
+name: Jenkins PR Board Test
+
+# PR opened/updated -> runner tells Jenkins (no token) -> Jenkins runs the board
+# tests and decides pass/fail with its own PASS_THRESHOLD -> this check waits
+# for that Jenkins build (read-only, no token) and passes or fails with it.
+
+on:
+  pull_request_target:
+    branches:
+      - v4.4.0-ti-next
+      - test-setup-default      # TEST ONLY: remove after the setup is verified
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jenkins-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  board-test:
+    name: Jenkins board test
+    runs-on: [self-hosted, linux, x64, jenkins-internal]
+    timeout-minutes: 360
+    env:
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      JENKINS_JOB: ${{ vars.JENKINS_PR_JOB || 'zephyr-ci-3' }}
+      REPO: ${{ github.repository }}
+      PR_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Notify Jenkins and wait for the result
+        shell: bash
+        run: |
+          set -euo pipefail
+          # wait_for_jenkins <job> <commit-sha> <max-minutes>
+          # Finds the Jenkins build that tested <commit-sha>, waits for it to finish,
+          # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.
+          # Uses only anonymous read access to Jenkins (no token).
+          wait_for_jenkins() {
+            local job="$1" sha="$2" max_min="$3" api build result url line
+            api="${JENKINS_URL%/}/job/${job}/api/json?tree=builds%5Bnumber,result,building,url,actions%5BlastBuiltRevision%5BSHA1%5D%5D%5D%7B0,40%7D"
+            for _ in $(seq 1 $((max_min * 2))); do
+              build=$(curl -sf "$api" | jq -c --arg s "$sha" \
+                '[.builds[] | select(any(.actions[]?; .lastBuiltRevision.SHA1? == $s))] | first // empty') || build=""
+              if [[ -n "$build" ]]; then
+                url=$(echo "$build" | jq -r .url)
+                if [[ "$(echo "$build" | jq -r .building)" == "false" ]]; then
+                  result=$(echo "$build" | jq -r .result)
+                  line=$(curl -sf "${url}consoleText" | grep -m1 '^RESULT:' || true)
+                  echo "Jenkins build: $url"
+                  echo "Jenkins result: $result"
+                  echo "${line:-RESULT: (no pass-rate line in log)}"
+                  { echo "### Jenkins $job: $result"; echo "${line:-}"; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+                  [[ "$result" == "SUCCESS" ]]
+                  return
+                fi
+                echo "Jenkins build running: $url"
+              else
+                echo "Waiting for Jenkins to start a build of $job for commit ${sha:0:12}..."
+              fi
+              sleep 30
+            done
+            echo "ERROR: no finished Jenkins build of $job for ${sha:0:12} within $max_min minutes"
+            return 1
+          }
+
+          [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
+          [[ "$PR_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: invalid commit"; exit 1; }
+
+          # 1. Tell Jenkins the repo changed (open endpoint, no token)
+          REPO_URL="https://github.com/$REPO"
+          PAYLOAD=$(jq -n --arg u "$REPO_URL" '{repository:{url:$u,html_url:$u,clone_url:($u+".git")},pusher:{name:"github-actions"}}')
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${JENKINS_URL%/}/github-webhook/" \
+            -H "Content-Type: application/json" -H "X-GitHub-Event: push" --data "$PAYLOAD")
+          echo "Jenkins notified: HTTP $CODE"
+          [[ "$CODE" == "200" ]] || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
+
+          # 2. Wait for the Jenkins build of this exact PR commit; pass/fail with it
+          wait_for_jenkins "$JENKINS_JOB" "$PR_SHA" 330
