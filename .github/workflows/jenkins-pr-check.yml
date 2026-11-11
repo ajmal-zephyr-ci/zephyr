@@ -1,4 +1,4 @@
-name: Jenkins PR Board Test
+name: PR Board Test
 
 # PR opened/updated -> runner tells Jenkins (no token) -> Jenkins runs the board
 # tests and decides pass/fail with its own PASS_THRESHOLD -> this check waits
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   gate:
-    name: Check PR is allowed
+    name: PR eligibility check
     runs-on: [self-hosted, linux, x64, jenkins-internal]
     timeout-minutes: 5
     outputs:
@@ -37,6 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
           [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
           # Single source of truth: the Jenkins job's parameter defaults
           # (ALLOWED_PR_AUTHORS, PR_TARGET_BRANCH), read without a token.
@@ -69,7 +70,7 @@ jobs:
           fi
 
   board-test:
-    name: Jenkins board test
+    name: Board tests on hardware (Jenkins)
     needs: gate
     if: needs.gate.outputs.allowed == 'true'
     runs-on: [self-hosted, linux, x64, jenkins-internal]
@@ -84,6 +85,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
           # wait_for_jenkins <job> <commit-sha> <max-minutes>
           # Finds the Jenkins build that tested <commit-sha>, waits for it to finish,
           # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.

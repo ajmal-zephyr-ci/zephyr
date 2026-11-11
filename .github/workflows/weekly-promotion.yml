@@ -1,4 +1,4 @@
-name: Weekly Promotion
+name: Weekly Promotion (next to main)
 
 # Every Monday: open (or reuse) a PR next -> main, point a candidate branch at
 # next, tell Jenkins (no token), wait for the promotion job's result (Jenkins
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   promote:
-    name: Test and promote next to main
+    name: Test on hardware and merge next into main
     runs-on: [self-hosted, linux, x64, jenkins-internal]
     timeout-minutes: 360
     env:
@@ -36,6 +36,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
           # wait_for_jenkins <job> <commit-sha> <max-minutes>
           # Finds the Jenkins build that tested <commit-sha>, waits for it to finish,
           # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.

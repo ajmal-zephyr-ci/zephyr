@@ -1,4 +1,4 @@
-name: Nightly Board Tests
+name: Nightly Board Test Results
 
 # Jenkins runs the nightly jobs on its own timer (Build periodically).
 # Each morning this workflow reads their latest results (read-only, no token)
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   nightly:
-    name: Nightly results
+    name: Fetch nightly results from Jenkins
     runs-on: [self-hosted, linux, x64, jenkins-internal]
     timeout-minutes: 10
     env:
@@ -26,6 +26,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
           [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
           FAILED=0
           echo "### Nightly board tests" >> "$GITHUB_STEP_SUMMARY"
