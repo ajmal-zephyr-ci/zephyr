@@ -8,7 +8,6 @@ on:
   pull_request_target:
     branches:
       - v4.4.0-ti-next
-      - test-setup-default      # TEST ONLY: remove after the setup is verified
     types: [opened, synchronize, reopened]
 
 permissions:

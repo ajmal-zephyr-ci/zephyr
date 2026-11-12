@@ -6,7 +6,7 @@ name: Nightly Board Test Results
 
 on:
   schedule:
-    - cron: '*/15 * * * *'     # 06:00 IST every day
+    - cron: '30 0 * * *'     # 06:00 IST every day
   workflow_dispatch:
 
 permissions:
