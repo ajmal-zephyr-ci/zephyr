@@ -13,6 +13,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  checks: read
+  statuses: read
 
 concurrency:
   group: weekly-promotion
@@ -32,6 +34,11 @@ jobs:
       CANDIDATE: promotion/candidate
       REPO: ${{ github.repository }}
       NOTIFY_USERS: ${{ vars.PROMOTION_NOTIFY_USERS || '' }}
+      APP_ID: ${{ secrets.PROMOTION_APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.PROMOTION_APP_PRIVATE_KEY }}
+      REQUIRE_PR_CHECKS: ${{ vars.REQUIRE_PR_CHECKS || 'true' }}
+      PR_CHECKS_TIMEOUT_MIN: ${{ vars.PR_CHECKS_TIMEOUT_MIN || '120' }}
+      SELF_JOB: Test on hardware and merge next into main
     steps:
       - name: Prepare, test, and merge
         shell: bash
@@ -71,7 +78,38 @@ jobs:
           }
 
           [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
-          for tool in gh jq curl; do command -v "$tool" >/dev/null || { echo "ERROR: $tool missing"; exit 1; }; done
+          for tool in gh jq curl openssl; do command -v "$tool" >/dev/null || { echo "ERROR: $tool missing"; exit 1; }; done
+
+          # GitHub App identity ("robot user"). PRs it opens are treated like a normal
+          # contributor's, so the repo's PR checks start automatically. Without the
+          # app secrets, the built-in workflow key is used (checks then need approval).
+          # App keys last 1 hour, so a fresh one is made before each group of API calls.
+          use_app_identity() {
+            if [[ -z "${APP_ID:-}" || -z "${APP_PRIVATE_KEY:-}" ]]; then
+              echo "GitHub App secrets not set - using the built-in workflow key"
+              return 0
+            fi
+            local now hdr pay sig jwt inst tok keyfile
+            b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            keyfile=$(mktemp); printf '%s\n' "$APP_PRIVATE_KEY" > "$keyfile"
+            now=$(date +%s)
+            hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+            pay=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$APP_ID" | b64url)
+            sig=$(printf '%s.%s' "$hdr" "$pay" | openssl dgst -sha256 -sign "$keyfile" | b64url)
+            rm -f "$keyfile"
+            jwt="$hdr.$pay.$sig"
+            inst=$(curl -sf -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/installation" | jq -r '.id // empty') \
+              || { echo "ERROR: GitHub App is not installed on $REPO"; exit 1; }
+            tok=$(curl -sf -X POST -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/app/installations/$inst/access_tokens" | jq -r '.token // empty') \
+              || { echo "ERROR: could not get a GitHub App key"; exit 1; }
+            [[ -n "$tok" ]] || { echo "ERROR: empty GitHub App key"; exit 1; }
+            echo "::add-mask::$tok"
+            export GH_TOKEN="$tok"
+            echo "Using the GitHub App identity"
+          }
+          use_app_identity
 
           # Everything below uses only the GitHub web API (gh api): no local git
           # checkout is needed, so leftover or missing folders cannot break it.
@@ -102,7 +140,7 @@ jobs:
             PR=$(gh api -X POST "repos/$REPO/pulls" \
               -f title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH" \
               -f head="$NEXT_BRANCH" -f base="$MAIN_BRANCH" \
-              -f body="Automatic weekly promotion. Merged only if the Jenkins board tests reach the configured pass threshold." \
+              -f body="Automatic weekly promotion. Merged only if the Jenkins board tests reach the configured pass threshold. After merging, do NOT delete the source branch ($NEXT_BRANCH)." \
               -q .number)
           fi
           echo "Promotion PR: #$PR"
@@ -124,12 +162,65 @@ jobs:
             printf 'Jenkins job: %s\n%s\n%s\n' "${job_build:-$JENKINS_JOB}" "$jenkins_result" "$result_line"
           }
           comment() { gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$1" >/dev/null; }
+
+          # Wait for the PR checks (compliance, coding guidelines, ...) on the promoted
+          # commit. Prints "CHECK: ..." lines; returns 0 only if all passed (or were skipped).
+          wait_for_pr_checks() {
+            local start last_auth now runs total pending failed st st_total
+            start=$(date +%s); last_auth=$start
+            while :; do
+              now=$(date +%s)
+              if (( now - last_auth > 2400 )); then use_app_identity >&2; last_auth=$now; fi
+              runs=$(gh api --paginate "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+                -q ".check_runs[] | select(any(.pull_requests[]?; .number == $PR)) | select(.name != \"$SELF_JOB\") | {name, status, conclusion}" \
+                | jq -s '.')
+              st=$(gh api "repos/$REPO/commits/$SHA/status" -q '.state'); st_total=$(gh api "repos/$REPO/commits/$SHA/status" -q '.total_count')
+              total=$(echo "$runs" | jq 'length')
+              pending=$(echo "$runs" | jq '[.[] | select(.status != "completed")] | length')
+              failed=$(echo "$runs" | jq -r '.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not)) | "CHECK: \(.name): \(.conclusion)"')
+              if [[ -n "$failed" || ( "$st_total" != "0" && ( "$st" == "failure" || "$st" == "error" ) ) ]]; then
+                echo "CHECK: PR checks FAILED"; [[ -n "$failed" ]] && echo "$failed"
+                [[ "$st" == "failure" || "$st" == "error" ]] && echo "CHECK: commit status: $st"
+                return 1
+              fi
+              if (( total > 0 && pending == 0 )) && [[ "$st_total" == "0" || "$st" == "success" ]]; then
+                echo "CHECK: all $total PR checks passed (or were skipped)"
+                return 0
+              fi
+              if (( total == 0 && now - start > 900 )); then
+                echo "CHECK: no PR checks found on PR #$PR after 15 minutes (waiting for approval?)"
+                return 1
+              fi
+              if (( now - start > PR_CHECKS_TIMEOUT_MIN * 60 )); then
+                echo "CHECK: PR checks still running after $PR_CHECKS_TIMEOUT_MIN minutes:"
+                echo "$runs" | jq -r '.[] | select(.status != "completed") | "CHECK: \(.name): \(.status)"'
+                return 1
+              fi
+              echo "Waiting for PR checks: $pending of $total still running..." >&2
+              sleep 30
+            done
+          }
           MENTIONS=""
           for u in $NOTIFY_USERS; do MENTIONS="$MENTIONS @${u#@}"; done
 
           if OUT=$(wait_for_jenkins "$JENKINS_JOB" "$SHA" 330); then
             echo "$OUT"
-            comment "$(printf '**Weekly promotion %s: board tests passed - merging.**\n\n```\n%s\n```\n' "$WEEK" "$(report "$OUT")")"
+            use_app_identity
+            CHECKS="CHECK: PR checks not required (REQUIRE_PR_CHECKS=$REQUIRE_PR_CHECKS)"
+            if [[ "$REQUIRE_PR_CHECKS" == "true" ]]; then
+              echo "Board tests passed. Waiting for the PR checks on PR #$PR..."
+              if ! CHECKS=$(wait_for_pr_checks); then
+                echo "$CHECKS"
+                gh api -X POST "repos/$REPO/labels" -f name=promotion-failed -f color=B60205 \
+                  -f description="Weekly promotion blocked by board test results" >/dev/null 2>&1 || true
+                gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=promotion-failed" >/dev/null 2>&1 || true
+                comment "$(printf '**Weekly promotion %s: NOT merged - board tests passed, but PR checks did not.**%s\n\n```\n%s\n%s\n```\nFix the failing checks on %s; the next promotion run will try again.\n' "$WEEK" "${MENTIONS:+ cc$MENTIONS}" "$(report "$OUT")" "$CHECKS" "$NEXT_BRANCH")"
+                echo "### Promotion $WEEK NOT merged: PR checks failed (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+            fi
+            echo "$CHECKS"
+            comment "$(printf '**Weekly promotion %s: board tests and PR checks passed - merging.**\n\n```\n%s\n%s\n```\n' "$WEEK" "$(report "$OUT")" "$CHECKS")"
             gh api -X DELETE "repos/$REPO/issues/$PR/labels/promotion-failed" >/dev/null 2>&1 || true
             gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=merge \
               -f commit_title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH (#$PR)" >/dev/null
@@ -137,6 +228,7 @@ jobs:
             echo "### Promotion $WEEK merged (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "$OUT"
+            use_app_identity
             gh api -X POST "repos/$REPO/labels" -f name=promotion-failed -f color=B60205 \
               -f description="Weekly promotion blocked by board test results" >/dev/null 2>&1 || true
             gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=promotion-failed" >/dev/null 2>&1 || true
