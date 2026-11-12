@@ -26,7 +26,7 @@ jobs:
       allowed: ${{ steps.check.outputs.allowed }}
     env:
       JENKINS_URL: ${{ secrets.JENKINS_URL }}
-      JENKINS_JOB: ${{ vars.JENKINS_PR_JOB || 'pr-mspm0g3519' }}
+      JENKINS_JOB: ${{ vars.JENKINS_TEST_JOB || 'zephyr-test' }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       PR_ROLE: ${{ github.event.pull_request.author_association }}
       PR_BASE: ${{ github.event.pull_request.base.ref }}
@@ -76,7 +76,7 @@ jobs:
     timeout-minutes: 360
     env:
       JENKINS_URL: ${{ secrets.JENKINS_URL }}
-      JENKINS_JOB: ${{ vars.JENKINS_PR_JOB || 'zephyr-ci-3' }}
+      JENKINS_JOB: ${{ vars.JENKINS_TEST_JOB || 'zephyr-test' }}
       REPO: ${{ github.repository }}
       PR_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
@@ -85,25 +85,30 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
-          # wait_for_jenkins <job> <commit-sha> <max-minutes>
+          # wait_for_jenkins <job> <commit-sha> <max-minutes> <mode>
+          # The parent job handles PR, nightly and promotion, so a build is matched by
+          # its description "<mode> <commit>" (set by the parent), not by any checkout.
           # Finds the Jenkins build that tested <commit-sha>, waits for it to finish,
           # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.
           # Uses only anonymous read access to Jenkins (no token).
           wait_for_jenkins() {
-            local job="$1" sha="$2" max_min="$3" api build result url line
-            api="${JENKINS_URL%/}/job/${job}/api/json?tree=builds%5Bnumber,result,building,url,actions%5BlastBuiltRevision%5BSHA1%5D%5D%5D%7B0,40%7D"
+            local job="$1" sha="$2" max_min="$3" mode="$4" api build result url line
+            api="${JENKINS_URL%/}/job/${job}/api/json?tree=builds%5Bnumber,result,building,url,description%5D%7B0,60%7D"
             for _ in $(seq 1 $((max_min * 2))); do
-              build=$(curl -sf "$api" | jq -c --arg s "$sha" \
-                '[.builds[] | select(any(.actions[]?; .lastBuiltRevision.SHA1? == $s))] | first // empty') || build=""
+              build=$(curl -sf "$api" | jq -c --arg s "$sha" --arg m "$mode" \
+                '[.builds[] | select((.description // "") | startswith($m + " " + $s))] | first // empty') || build=""
               if [[ -n "$build" ]]; then
                 url=$(echo "$build" | jq -r .url)
                 if [[ "$(echo "$build" | jq -r .building)" == "false" ]]; then
                   result=$(echo "$build" | jq -r .result)
-                  line=$(curl -sf "${url}consoleText" | grep -m1 '^RESULT:' || true)
+                  # Parent pipeline prints one BOARD_RESULT line per board; a single
+                  # board job prints a RESULT line. Show whichever the build has.
+                  line=$(curl -sf "${url}consoleText" | grep -o 'BOARD_RESULT: .*' || true)
+                  [[ -n "$line" ]] || line=$(curl -sf "${url}consoleText" | grep -m1 '^RESULT:' || true)
                   echo "Jenkins build: $url"
                   echo "Jenkins result: $result"
-                  echo "${line:-RESULT: (no pass-rate line in log)}"
-                  { echo "### Jenkins $job: $result"; echo "${line:-}"; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+                  echo "${line:-RESULT: (no result lines in log)}"
+                  { echo "### Jenkins $job: $result"; echo '```'; echo "${line:-}" | sed 's# job=[^ ]* build=[0-9]*##'; echo '```'; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
                   [[ "$result" == "SUCCESS" ]]
                   return
                 fi
@@ -129,4 +134,4 @@ jobs:
           [[ "$CODE" == "200" ]] || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
 
           # 2. Wait for the Jenkins build of this exact PR commit; pass/fail with it
-          wait_for_jenkins "$JENKINS_JOB" "$PR_SHA" 330
+          wait_for_jenkins "$JENKINS_JOB" "$PR_SHA" 330 pr

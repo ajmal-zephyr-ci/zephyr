@@ -28,12 +28,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       JENKINS_URL: ${{ secrets.JENKINS_URL }}
-      JENKINS_JOB: ${{ vars.JENKINS_PROMOTION_JOB || 'promotion-mspm0g3519' }}
+      JENKINS_JOB: ${{ vars.JENKINS_PROMOTION_JOB || 'zephyr-promotion' }}
       NEXT_BRANCH: ${{ vars.NEXT_BRANCH || 'v4.4.0-ti-next' }}
       MAIN_BRANCH: ${{ vars.MAIN_BRANCH || 'v4.4.0-ti' }}
       CANDIDATE: promotion/candidate
       REPO: ${{ github.repository }}
       NOTIFY_USERS: ${{ vars.PROMOTION_NOTIFY_USERS || '' }}
+      NOTIFY_COMMIT_AUTHORS: ${{ vars.NOTIFY_COMMIT_AUTHORS || 'true' }}
       APP_ID: ${{ secrets.PROMOTION_APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.PROMOTION_APP_PRIVATE_KEY }}
       REQUIRE_PR_CHECKS: ${{ vars.REQUIRE_PR_CHECKS || 'true' }}
@@ -45,25 +46,30 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
-          # wait_for_jenkins <job> <commit-sha> <max-minutes>
+          # wait_for_jenkins <job> <commit-sha> <max-minutes> <mode>
+          # The parent job handles PR, nightly and promotion, so a build is matched by
+          # its description "<mode> <commit>" (set by the parent), not by any checkout.
           # Finds the Jenkins build that tested <commit-sha>, waits for it to finish,
           # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.
           # Uses only anonymous read access to Jenkins (no token).
           wait_for_jenkins() {
-            local job="$1" sha="$2" max_min="$3" api build result url line
-            api="${JENKINS_URL%/}/job/${job}/api/json?tree=builds%5Bnumber,result,building,url,actions%5BlastBuiltRevision%5BSHA1%5D%5D%5D%7B0,40%7D"
+            local job="$1" sha="$2" max_min="$3" mode="$4" api build result url line
+            api="${JENKINS_URL%/}/job/${job}/api/json?tree=builds%5Bnumber,result,building,url,description%5D%7B0,60%7D"
             for _ in $(seq 1 $((max_min * 2))); do
-              build=$(curl -sf "$api" | jq -c --arg s "$sha" \
-                '[.builds[] | select(any(.actions[]?; .lastBuiltRevision.SHA1? == $s))] | first // empty') || build=""
+              build=$(curl -sf "$api" | jq -c --arg s "$sha" --arg m "$mode" \
+                '[.builds[] | select((.description // "") | startswith($m + " " + $s))] | first // empty') || build=""
               if [[ -n "$build" ]]; then
                 url=$(echo "$build" | jq -r .url)
                 if [[ "$(echo "$build" | jq -r .building)" == "false" ]]; then
                   result=$(echo "$build" | jq -r .result)
-                  line=$(curl -sf "${url}consoleText" | grep -m1 '^RESULT:' || true)
+                  # Parent pipeline prints one BOARD_RESULT line per board; a single
+                  # board job prints a RESULT line. Show whichever the build has.
+                  line=$(curl -sf "${url}consoleText" | grep -o 'BOARD_RESULT: .*' || true)
+                  [[ -n "$line" ]] || line=$(curl -sf "${url}consoleText" | grep -m1 '^RESULT:' || true)
                   echo "Jenkins build: $url"
                   echo "Jenkins result: $result"
-                  echo "${line:-RESULT: (no pass-rate line in log)}"
-                  { echo "### Jenkins $job: $result"; echo "${line:-}"; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+                  echo "${line:-RESULT: (no result lines in log)}"
+                  { echo "### Jenkins $job: $result"; echo '```'; echo "${line:-}" | sed 's# job=[^ ]* build=[0-9]*##'; echo '```'; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
                   [[ "$result" == "SUCCESS" ]]
                   return
                 fi
@@ -158,7 +164,7 @@ jobs:
             local job_build result_line jenkins_result
             job_build=$(echo "$1" | sed -n 's#^Jenkins build: .*/job/\([^/]*\)/\([0-9]*\)/.*#\1 build \2#p' | head -1)
             jenkins_result=$(echo "$1" | grep -m1 '^Jenkins result:' || true)
-            result_line=$(echo "$1" | grep -m1 '^RESULT:' || true)
+            result_line=$(echo "$1" | grep -E '^(BOARD_RESULT|RESULT):' | sed 's# job=[^ ]* build=[0-9]*##' || true)
             printf 'Jenkins job: %s\n%s\n%s\n' "${job_build:-$JENKINS_JOB}" "$jenkins_result" "$result_line"
           }
           comment() { gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$1" >/dev/null; }
@@ -200,10 +206,17 @@ jobs:
               sleep 30
             done
           }
+          # Who to notify on failure: the configured people, plus (optionally) the
+          # authors of the commits in this promotion. Bots are left out.
+          PEOPLE="$NOTIFY_USERS"
+          if [[ "$NOTIFY_COMMIT_AUTHORS" == "true" ]]; then
+            PEOPLE="$PEOPLE $(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" \
+              -q '[.commits[].author.login // empty | select(endswith("[bot]") | not)] | unique | .[]' 2>/dev/null | tr '\n' ' ')"
+          fi
           MENTIONS=""
-          for u in $NOTIFY_USERS; do MENTIONS="$MENTIONS @${u#@}"; done
+          for u in $(echo "$PEOPLE" | tr ' ' '\n' | sed 's/^@//' | sort -u); do MENTIONS="$MENTIONS @$u"; done
 
-          if OUT=$(wait_for_jenkins "$JENKINS_JOB" "$SHA" 330); then
+          if OUT=$(wait_for_jenkins "$JENKINS_JOB" "$SHA" 330 promotion); then
             echo "$OUT"
             use_app_identity
             CHECKS="CHECK: PR checks not required (REQUIRE_PR_CHECKS=$REQUIRE_PR_CHECKS)"
