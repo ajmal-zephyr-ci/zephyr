@@ -31,6 +31,7 @@ jobs:
       MAIN_BRANCH: ${{ vars.MAIN_BRANCH || 'v4.4.0-ti' }}
       CANDIDATE: promotion/candidate
       REPO: ${{ github.repository }}
+      NOTIFY_USERS: ${{ vars.PROMOTION_NOTIFY_USERS || '' }}
     steps:
       - name: Prepare, test, and merge
         shell: bash
@@ -72,6 +73,10 @@ jobs:
           [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
           for tool in gh jq curl; do command -v "$tool" >/dev/null || { echo "ERROR: $tool missing"; exit 1; }; done
 
+          # Everything below uses only the GitHub web API (gh api): no local git
+          # checkout is needed, so leftover or missing folders cannot break it.
+          OWNER="${REPO%%/*}"
+
           # 1. Anything to promote?
           AHEAD=$(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" -q .ahead_by)
           if [[ "$AHEAD" == "0" ]]; then
@@ -89,14 +94,16 @@ jobs:
           else
             gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$CANDIDATE" -f sha="$SHA" >/dev/null
           fi
+          echo "Candidate branch $CANDIDATE -> ${SHA:0:12}"
 
           # 3. Open the promotion PR (or reuse the open one)
-          PR=$(gh pr list -R "$REPO" --base "$MAIN_BRANCH" --head "$NEXT_BRANCH" --state open --json number -q '.[0].number')
+          PR=$(gh api "repos/$REPO/pulls?state=open&base=$MAIN_BRANCH&head=$OWNER:$NEXT_BRANCH" -q '.[0].number // empty')
           if [[ -z "$PR" ]]; then
-            gh pr create -R "$REPO" --base "$MAIN_BRANCH" --head "$NEXT_BRANCH" \
-              --title "Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH" \
-              --body "Automatic weekly promotion. Merged only if the Jenkins board tests reach the configured pass threshold."
-            PR=$(gh pr list -R "$REPO" --base "$MAIN_BRANCH" --head "$NEXT_BRANCH" --state open --json number -q '.[0].number')
+            PR=$(gh api -X POST "repos/$REPO/pulls" \
+              -f title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH" \
+              -f head="$NEXT_BRANCH" -f base="$MAIN_BRANCH" \
+              -f body="Automatic weekly promotion. Merged only if the Jenkins board tests reach the configured pass threshold." \
+              -q .number)
           fi
           echo "Promotion PR: #$PR"
 
@@ -108,16 +115,32 @@ jobs:
           echo "Jenkins notified: HTTP $CODE"
           [[ "$CODE" == "200" ]] || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
 
+          # Report text for the public PR: no internal addresses, only job, build and result
+          report() {
+            local job_build result_line jenkins_result
+            job_build=$(echo "$1" | sed -n 's#^Jenkins build: .*/job/\([^/]*\)/\([0-9]*\)/.*#\1 build \2#p' | head -1)
+            jenkins_result=$(echo "$1" | grep -m1 '^Jenkins result:' || true)
+            result_line=$(echo "$1" | grep -m1 '^RESULT:' || true)
+            printf 'Jenkins job: %s\n%s\n%s\n' "${job_build:-$JENKINS_JOB}" "$jenkins_result" "$result_line"
+          }
+          comment() { gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$1" >/dev/null; }
+          MENTIONS=""
+          for u in $NOTIFY_USERS; do MENTIONS="$MENTIONS @${u#@}"; done
+
           if OUT=$(wait_for_jenkins "$JENKINS_JOB" "$SHA" 330); then
             echo "$OUT"
-            gh pr comment "$PR" -R "$REPO" --body "Jenkins board tests passed. Merging.
-          $(echo "$OUT" | grep '^RESULT:' || true)"
-            gh pr merge "$PR" -R "$REPO" --merge
+            comment "$(printf '**Weekly promotion %s: board tests passed - merging.**\n\n```\n%s\n```\n' "$WEEK" "$(report "$OUT")")"
+            gh api -X DELETE "repos/$REPO/issues/$PR/labels/promotion-failed" >/dev/null 2>&1 || true
+            gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=merge \
+              -f commit_title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH (#$PR)" >/dev/null
+            echo "Merged PR #$PR into $MAIN_BRANCH"
             echo "### Promotion $WEEK merged (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "$OUT"
-            gh pr comment "$PR" -R "$REPO" --body "Jenkins board tests did not reach the pass threshold. Not merged.
-          $(echo "$OUT" | grep -E '^(RESULT|Jenkins)' || true)"
+            gh api -X POST "repos/$REPO/labels" -f name=promotion-failed -f color=B60205 \
+              -f description="Weekly promotion blocked by board test results" >/dev/null 2>&1 || true
+            gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=promotion-failed" >/dev/null 2>&1 || true
+            comment "$(printf '**Weekly promotion %s: NOT merged - board tests below the pass threshold.**%s\n\n```\n%s\n```\nFix the failures on %s; the next promotion run will test again.\n' "$WEEK" "${MENTIONS:+ cc$MENTIONS}" "$(report "$OUT")" "$NEXT_BRANCH")"
             echo "### Promotion $WEEK NOT merged (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
