@@ -179,14 +179,18 @@ jobs:
           # falls back to the /github-webhook/ notification, which asks Jenkins to look
           # for new commits itself.
           start_jenkins() {
-            local q="" crumb field code
+            local q="" json crumb field code jar
             for kv in "$@"; do q="$q&$kv"; done
-            crumb=$(curl -sf "${JENKINS_URL%/}/crumbIssuer/api/json" || true)
-            field=$(echo "$crumb" | jq -r '.crumbRequestField // empty' 2>/dev/null || true)
-            crumb=$(echo "$crumb" | jq -r '.crumb // empty' 2>/dev/null || true)
-            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            # Jenkins ties the CSRF crumb to the session, so the crumb request and
+            # the POST must share cookies: hence the cookie jar.
+            jar=$(mktemp)
+            json=$(curl -sf -c "$jar" "${JENKINS_URL%/}/crumbIssuer/api/json" || true)
+            field=$(echo "$json" | jq -r '.crumbRequestField // empty' 2>/dev/null || true)
+            crumb=$(echo "$json" | jq -r '.crumb // empty' 2>/dev/null || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jar" -c "$jar" \
               ${field:+-H "$field: $crumb"} \
               "${JENKINS_URL%/}/job/${JENKINS_JOB}/buildWithParameters?${q#&}")
+            rm -f "$jar"
             if [[ "$code" == "201" || "$code" == "200" || "$code" == "302" ]]; then
               echo "Jenkins build requested: HTTP $code"
               return 0
