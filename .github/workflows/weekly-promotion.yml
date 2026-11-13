@@ -180,8 +180,30 @@ jobs:
           # falls back to the /github-webhook/ notification, which asks Jenkins to look
           # for new commits itself.
           DIRECT_START=no
+          KEY_PARAM=""
+          # already_running <key>: true if Jenkins is already queued or building this
+          # PR (or this promotion). Checked before every start request, so a retry, a
+          # second workflow run, or a leftover run can never queue the same work twice.
+          already_running() {
+            local key="$1" q b
+            q=$(curl -sf "${JENKINS_URL%/}/queue/api/json?tree=items%5Btask%5Bname%5D,params%5D" \
+              | jq -r --arg j "$JENKINS_JOB" --arg k "$KEY_PARAM" \
+                '[.items[]? | select(.task.name == $j) | .params // ""] | join(" ")' 2>/dev/null || true)
+            if [[ -n "$KEY_PARAM" && "$q" == *"$KEY_PARAM"* ]]; then
+              echo "Jenkins already has this queued; not asking again"; return 0
+            fi
+            [[ -z "$KEY_PARAM" && -n "$q" ]] && { echo "Jenkins already has this queued; not asking again"; return 0; }
+            b=$(curl -sf "${JENKINS_URL%/}/job/${JENKINS_JOB}/api/json?tree=builds%5Bbuilding,description%5D%7B0,10%7D" \
+              | jq -r --arg k "$key" '[.builds[]? | select(.building == true and ((.description // "") | startswith($k)))] | length' 2>/dev/null || echo 0)
+            if [[ "${b:-0}" != "0" ]]; then
+              echo "Jenkins is already building this; not asking again"; return 0
+            fi
+            return 1
+          }
+
           start_jenkins() {
             local q="" json crumb field code jar
+            if already_running "promotion $SHA"; then DIRECT_START=yes; return 0; fi
             for kv in "$@"; do q="$q&$kv"; done
             # Jenkins ties the CSRF crumb to the session, so the crumb request and
             # the POST must share cookies: hence the cookie jar.
