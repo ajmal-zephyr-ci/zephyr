@@ -157,7 +157,6 @@ jobs:
           echo "Promotion PR: #$PR"
 
           # 4. Tell Jenkins (no token), then wait for its verdict on this exact commit
-          start_jenkins || { echo "ERROR: could not reach Jenkins"; exit 1; }
 
           # notify_jenkins: tell Jenkins the repo changed (open endpoint, no token).
           # Jenkins re-checks the repo once and builds only if it finds a new commit.
@@ -224,6 +223,10 @@ jobs:
             DIRECT_START=no      # Jenkins may find nothing to do, so the wait loop retries
             notify_jenkins
           }
+
+          # Start Jenkins only after notify_jenkins(), already_running(), and
+          # start_jenkins() have all been defined.
+          start_jenkins || { echo "ERROR: could not reach Jenkins"; exit 1; }
 
           # Report text for the public PR: no internal addresses, only job, build and result
           report() {
