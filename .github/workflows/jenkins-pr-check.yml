@@ -107,7 +107,7 @@ jobs:
           # falls back to the /github-webhook/ notification, which asks Jenkins to look
           # for new commits itself.
           DIRECT_START=no
-          KEY_PARAM="PR_NUMBER=$PR_NUMBER"
+          KEY_PARAM="PR_HEAD=$PR_SHA"
           # already_running <key>: true if Jenkins is already queued or building this
           # PR (or this promotion). Checked before every start request, so a retry, a
           # second workflow run, or a leftover run can never queue the same work twice.
@@ -130,7 +130,7 @@ jobs:
 
           start_jenkins() {
             local q="" json crumb field code jar
-            if already_running "pr PR#$PR_NUMBER"; then DIRECT_START=yes; return 0; fi
+            if already_running "pr PR#$PR_NUMBER@${PR_SHA:0:12}"; then DIRECT_START=yes; return 0; fi
             for kv in "$@"; do q="$q&$kv"; done
             # Jenkins ties the CSRF crumb to the session, so the crumb request and
             # the POST must share cookies: hence the cookie jar.
@@ -188,7 +188,7 @@ jobs:
                 # Only the notification path can silently do nothing, so only that one
                 # is repeated (every 5 minutes). After a successful direct start the
                 # build is already queued, and asking again would run it twice.
-                if [[ "$DIRECT_START" != "yes" ]] && (( tries % 10 == 0 )); then start_jenkins "MODE=pr" "PR_NUMBER=$PR_NUMBER" || true; fi
+                if [[ "$DIRECT_START" != "yes" ]] && (( tries % 10 == 0 )); then start_jenkins "MODE=pr" "PR_NUMBER=$PR_NUMBER" "PR_HEAD=$PR_SHA" || true; fi
               fi
               sleep 30
             done
@@ -201,10 +201,10 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid PR number"; exit 1; }
 
           # 1. Ask Jenkins to test this PR
-          start_jenkins "MODE=pr" "PR_NUMBER=$PR_NUMBER" \
+          start_jenkins "MODE=pr" "PR_NUMBER=$PR_NUMBER" "PR_HEAD=$PR_SHA" \
             || { echo "ERROR: could not reach Jenkins"; exit 1; }
 
           # 2. Wait for the Jenkins build of this PR; pass/fail with it
           echo "PR #$PR_NUMBER, head commit ${PR_SHA:0:12}"
           sleep 20   # let the queued build appear and set its description
-          wait_for_jenkins "$JENKINS_JOB" "PR#$PR_NUMBER" 330 pr
+          wait_for_jenkins "$JENKINS_JOB" "PR#$PR_NUMBER@${PR_SHA:0:12}" 330 pr
