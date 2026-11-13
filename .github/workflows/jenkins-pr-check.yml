@@ -79,15 +79,18 @@ jobs:
       JENKINS_JOB: ${{ vars.JENKINS_TEST_JOB || 'zephyr-test' }}
       REPO: ${{ github.repository }}
       PR_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - name: Notify Jenkins and wait for the result
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
-          # wait_for_jenkins <job> <commit-sha> <max-minutes> <mode>
-          # The parent job handles PR, nightly and promotion, so a build is matched by
-          # its description "<mode> <commit>" (set by the parent), not by any checkout.
+          # wait_for_jenkins <job> <key> <max-minutes> <mode>
+          # zephyr-test runs PRs and the nightly, so a build is matched by its
+          # description "<mode> <key>". For a PR the key is "PR#<number>", because
+          # Jenkins tests the PR's merge preview, whose commit id differs from the
+          # PR head commit GitHub knows.
           # Finds the Jenkins build that tested <commit-sha>, waits for it to finish,
           # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.
           # Uses only anonymous read access to Jenkins (no token).
@@ -124,6 +127,7 @@ jobs:
 
           [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
           [[ "$PR_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: invalid commit"; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid PR number"; exit 1; }
 
           # 1. Tell Jenkins the repo changed (open endpoint, no token)
           REPO_URL="https://github.com/$REPO"
@@ -133,5 +137,6 @@ jobs:
           echo "Jenkins notified: HTTP $CODE"
           [[ "$CODE" == "200" ]] || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
 
-          # 2. Wait for the Jenkins build of this exact PR commit; pass/fail with it
-          wait_for_jenkins "$JENKINS_JOB" "$PR_SHA" 330 pr
+          # 2. Wait for the Jenkins build of this PR; pass/fail with it
+          echo "PR #$PR_NUMBER, head commit ${PR_SHA:0:12}"
+          wait_for_jenkins "$JENKINS_JOB" "PR#$PR_NUMBER" 330 pr
