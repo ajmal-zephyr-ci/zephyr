@@ -79,7 +79,7 @@ jobs:
                 tries=$((tries + 1))
                 # Re-notify every 2 minutes: the first notification can reach Jenkins
                 # before GitHub has published the new commit to test.
-                if (( tries % 4 == 0 )); then notify_jenkins || true; fi
+                if (( tries % 4 == 0 )); then start_jenkins || true; fi
               fi
               sleep 30
             done
@@ -156,7 +156,7 @@ jobs:
           echo "Promotion PR: #$PR"
 
           # 4. Tell Jenkins (no token), then wait for its verdict on this exact commit
-          notify_jenkins || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
+          start_jenkins || { echo "ERROR: could not reach Jenkins"; exit 1; }
 
           # notify_jenkins: tell Jenkins the repo changed (open endpoint, no token).
           # Jenkins re-checks the repo once and builds only if it finds a new commit.
@@ -171,6 +171,28 @@ jobs:
               -H "Content-Type: application/json" -H "X-GitHub-Event: push" --data "$payload")
             echo "Jenkins notified: HTTP $code"
             [[ "$code" == "200" ]]
+          }
+
+          # start_jenkins <param=value>...: start the Jenkins job directly, so Jenkins
+          # never has to work out what changed (no polling, no missed notifications).
+          # Needs Jenkins "Anonymous: Job/Build" permission; if that is not granted it
+          # falls back to the /github-webhook/ notification, which asks Jenkins to look
+          # for new commits itself.
+          start_jenkins() {
+            local q="" crumb field code
+            for kv in "$@"; do q="$q&$kv"; done
+            crumb=$(curl -sf "${JENKINS_URL%/}/crumbIssuer/api/json" || true)
+            field=$(echo "$crumb" | jq -r '.crumbRequestField // empty' 2>/dev/null || true)
+            crumb=$(echo "$crumb" | jq -r '.crumb // empty' 2>/dev/null || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              ${field:+-H "$field: $crumb"} \
+              "${JENKINS_URL%/}/job/${JENKINS_JOB}/buildWithParameters?${q#&}")
+            if [[ "$code" == "201" || "$code" == "200" || "$code" == "302" ]]; then
+              echo "Jenkins build requested: HTTP $code"
+              return 0
+            fi
+            echo "Could not start the job directly (HTTP $code); falling back to a notification"
+            notify_jenkins
           }
 
           # Report text for the public PR: no internal addresses, only job, build and result

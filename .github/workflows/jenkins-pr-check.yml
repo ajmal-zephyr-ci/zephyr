@@ -101,6 +101,28 @@ jobs:
             [[ "$code" == "200" ]]
           }
 
+          # start_jenkins <param=value>...: start the Jenkins job directly, so Jenkins
+          # never has to work out what changed (no polling, no missed notifications).
+          # Needs Jenkins "Anonymous: Job/Build" permission; if that is not granted it
+          # falls back to the /github-webhook/ notification, which asks Jenkins to look
+          # for new commits itself.
+          start_jenkins() {
+            local q="" crumb field code
+            for kv in "$@"; do q="$q&$kv"; done
+            crumb=$(curl -sf "${JENKINS_URL%/}/crumbIssuer/api/json" || true)
+            field=$(echo "$crumb" | jq -r '.crumbRequestField // empty' 2>/dev/null || true)
+            crumb=$(echo "$crumb" | jq -r '.crumb // empty' 2>/dev/null || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              ${field:+-H "$field: $crumb"} \
+              "${JENKINS_URL%/}/job/${JENKINS_JOB}/buildWithParameters?${q#&}")
+            if [[ "$code" == "201" || "$code" == "200" || "$code" == "302" ]]; then
+              echo "Jenkins build requested: HTTP $code"
+              return 0
+            fi
+            echo "Could not start the job directly (HTTP $code); falling back to a notification"
+            notify_jenkins
+          }
+
           # wait_for_jenkins <job> <key> <max-minutes> <mode>
           # zephyr-test runs PRs and the nightly, so a build is matched by its
           # description "<mode> <key>". For a PR the key is "PR#<number>", because
@@ -136,7 +158,7 @@ jobs:
                 tries=$((tries + 1))
                 # Re-notify every 2 minutes: the first notification can reach Jenkins
                 # before GitHub has published the new commit to test.
-                if (( tries % 4 == 0 )); then notify_jenkins || true; fi
+                if (( tries % 4 == 0 )); then start_jenkins "MODE=pr" "PR_NUMBER=$PR_NUMBER" || true; fi
               fi
               sleep 30
             done
@@ -148,8 +170,9 @@ jobs:
           [[ "$PR_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: invalid commit"; exit 1; }
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid PR number"; exit 1; }
 
-          # 1. Tell Jenkins the repo changed
-          notify_jenkins || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
+          # 1. Ask Jenkins to test this PR
+          start_jenkins "MODE=pr" "PR_NUMBER=$PR_NUMBER" \
+            || { echo "ERROR: could not reach Jenkins"; exit 1; }
 
           # 2. Wait for the Jenkins build of this PR; pass/fail with it
           echo "PR #$PR_NUMBER, head commit ${PR_SHA:0:12}"
