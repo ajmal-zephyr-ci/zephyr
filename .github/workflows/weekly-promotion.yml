@@ -77,9 +77,10 @@ jobs:
               else
                 echo "Waiting for Jenkins to start a build of $job for ${sha:0:12}..."
                 tries=$((tries + 1))
-                # Re-notify every 2 minutes: the first notification can reach Jenkins
-                # before GitHub has published the new commit to test.
-                if (( tries % 4 == 0 )); then start_jenkins || true; fi
+                # Only the notification path can silently do nothing, so only that one
+                # is repeated (every 5 minutes). After a successful direct start the
+                # build is already queued, and asking again would run it twice.
+                if [[ "$DIRECT_START" != "yes" ]] && (( tries % 10 == 0 )); then start_jenkins || true; fi
               fi
               sleep 30
             done
@@ -178,6 +179,7 @@ jobs:
           # Needs Jenkins "Anonymous: Job/Build" permission; if that is not granted it
           # falls back to the /github-webhook/ notification, which asks Jenkins to look
           # for new commits itself.
+          DIRECT_START=no
           start_jenkins() {
             local q="" json crumb field code jar
             for kv in "$@"; do q="$q&$kv"; done
@@ -193,9 +195,11 @@ jobs:
             rm -f "$jar"
             if [[ "$code" == "201" || "$code" == "200" || "$code" == "302" ]]; then
               echo "Jenkins build requested: HTTP $code"
+              DIRECT_START=yes   # the build is queued: never ask again, or it runs twice
               return 0
             fi
             echo "Could not start the job directly (HTTP $code); falling back to a notification"
+            DIRECT_START=no      # Jenkins may find nothing to do, so the wait loop retries
             notify_jenkins
           }
 
@@ -256,6 +260,7 @@ jobs:
           MENTIONS=""
           for u in $(echo "$PEOPLE" | tr ' ' '\n' | sed 's/^@//' | sort -u); do MENTIONS="$MENTIONS @$u"; done
 
+          sleep 20   # let the queued build appear and set its description
           if OUT=$(wait_for_jenkins "$JENKINS_JOB" "$SHA" 330 promotion); then
             echo "$OUT"
             use_app_identity
