@@ -122,42 +122,6 @@ jobs:
           }
           use_app_identity
 
-          # Everything below uses only the GitHub web API (gh api): no local git
-          # checkout is needed, so leftover or missing folders cannot break it.
-          OWNER="${REPO%%/*}"
-
-          # 1. Anything to promote?
-          AHEAD=$(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" -q .ahead_by)
-          if [[ "$AHEAD" == "0" ]]; then
-            echo "$NEXT_BRANCH has nothing new for $MAIN_BRANCH - nothing to promote"
-            echo "### Nothing to promote this week" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          SHA=$(gh api "repos/$REPO/branches/$NEXT_BRANCH" -q .commit.sha)
-          WEEK=$(date +%G-W%V)
-          echo "Promoting $NEXT_BRANCH ($AHEAD commits, ${SHA:0:12}) into $MAIN_BRANCH for $WEEK"
-
-          # 2. Point the candidate branch at next (the promotion Jenkins job watches it)
-          if gh api "repos/$REPO/git/ref/heads/$CANDIDATE" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$CANDIDATE" -f sha="$SHA" -F force=true >/dev/null
-          else
-            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$CANDIDATE" -f sha="$SHA" >/dev/null
-          fi
-          echo "Candidate branch $CANDIDATE -> ${SHA:0:12}"
-
-          # 3. Open the promotion PR (or reuse the open one)
-          PR=$(gh api "repos/$REPO/pulls?state=open&base=$MAIN_BRANCH&head=$OWNER:$NEXT_BRANCH" -q '.[0].number // empty')
-          if [[ -z "$PR" ]]; then
-            PR=$(gh api -X POST "repos/$REPO/pulls" \
-              -f title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH" \
-              -f head="$NEXT_BRANCH" -f base="$MAIN_BRANCH" \
-              -f body="Automatic weekly promotion. Merged only if the Jenkins board tests reach the configured pass threshold. After merging, do NOT delete the source branch ($NEXT_BRANCH)." \
-              -q .number)
-          fi
-          echo "Promotion PR: #$PR"
-
-          # 4. Tell Jenkins (no token), then wait for its verdict on this exact commit
-
           # notify_jenkins: tell Jenkins the repo changed (open endpoint, no token).
           # Jenkins re-checks the repo once and builds only if it finds a new commit.
           # GitHub needs a few seconds to recompute a PR's merge preview, so the first
@@ -224,9 +188,72 @@ jobs:
             notify_jenkins
           }
 
-          # Start Jenkins only after notify_jenkins(), already_running(), and
-          # start_jenkins() have all been defined.
+          # Everything below uses only the GitHub web API (gh api): no local git
+          # checkout is needed, so leftover or missing folders cannot break it.
+          OWNER="${REPO%%/*}"
+
+          # 1. Anything to promote?
+          AHEAD=$(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" -q .ahead_by)
+          if [[ "$AHEAD" == "0" ]]; then
+            echo "$NEXT_BRANCH has nothing new for $MAIN_BRANCH - nothing to promote"
+            echo "### Nothing to promote this week" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          SHA=$(gh api "repos/$REPO/branches/$NEXT_BRANCH" -q .commit.sha)
+          WEEK=$(date +%G-W%V)
+          echo "Promoting $NEXT_BRANCH ($AHEAD commits, ${SHA:0:12}) into $MAIN_BRANCH for $WEEK"
+
+          # 2. Point the candidate branch at next (the promotion Jenkins job watches it)
+          if gh api "repos/$REPO/git/ref/heads/$CANDIDATE" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$CANDIDATE" -f sha="$SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$CANDIDATE" -f sha="$SHA" >/dev/null
+          fi
+          echo "Candidate branch $CANDIDATE -> ${SHA:0:12}"
+
+          # 3. Open the promotion PR (or reuse the open one)
+          PR=$(gh api "repos/$REPO/pulls?state=open&base=$MAIN_BRANCH&head=$OWNER:$NEXT_BRANCH" -q '.[0].number // empty')
+          if [[ -z "$PR" ]]; then
+            PR=$(gh api -X POST "repos/$REPO/pulls" \
+              -f title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH" \
+              -f head="$NEXT_BRANCH" -f base="$MAIN_BRANCH" \
+              -f body="Automatic weekly promotion. Merged only if the Jenkins board tests reach the configured pass threshold. After merging, do NOT delete the source branch ($NEXT_BRANCH)." \
+              -q .number)
+          fi
+          # Who to notify on failure: the configured people, plus (optionally) the
+          # authors of the commits in this promotion. Bots are left out.
+          PEOPLE="$NOTIFY_USERS"
+          if [[ "$NOTIFY_COMMIT_AUTHORS" == "true" ]]; then
+            PEOPLE="$PEOPLE $(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" \
+              -q '[.commits[].author.login // empty | select(endswith("[bot]") | not)] | unique | .[]' 2>/dev/null | tr '\n' ' ')"
+          fi
+          MENTIONS=""
+          for u in $(echo "$PEOPLE" | tr ' ' '\n' | sed 's/^@//' | sort -u); do MENTIONS="$MENTIONS @$u"; done
+
+          echo "Promotion PR: #$PR"
+
+          # 3b. Can this PR actually merge? GitHub needs a moment to work it out.
+          # Testing a PR that cannot merge wastes a full board run, so stop here.
+          MERGEABLE=""
+          for _ in $(seq 1 10); do
+            MERGEABLE=$(gh api "repos/$REPO/pulls/$PR" -q '.mergeable_state // ""')
+            [[ "$MERGEABLE" != "unknown" && -n "$MERGEABLE" ]] && break
+            sleep 6
+          done
+          echo "Merge state: ${MERGEABLE:-unknown}"
+          if [[ "$MERGEABLE" == "dirty" ]]; then
+            gh api -X POST "repos/$REPO/labels" -f name=promotion-failed -f color=B60205 \
+              -f description="Weekly promotion blocked" >/dev/null 2>&1 || true
+            gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=promotion-failed" >/dev/null 2>&1 || true
+            CONFLICTS=$(gh api "repos/$REPO/pulls/$PR/files" -q '[.[].filename] | join(", ")' 2>/dev/null | cut -c1-300)
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$(printf '**Weekly promotion %s: NOT merged - %s and %s have conflicting changes.**%s\n\nNo board tests were run, because the merge cannot happen until the conflict is resolved.\n\nFiles in this promotion: %s\n' "$WEEK" "$NEXT_BRANCH" "$MAIN_BRANCH" "${MENTIONS:+ cc$MENTIONS}" "${CONFLICTS:-see the PR}")" >/dev/null
+            echo "### Promotion $WEEK NOT merged: merge conflict (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # 4. Tell Jenkins (no token), then wait for its verdict on this exact commit
           start_jenkins || { echo "ERROR: could not reach Jenkins"; exit 1; }
+
 
           # Report text for the public PR: no internal addresses, only job, build and result
           report() {
@@ -275,15 +302,6 @@ jobs:
               sleep 30
             done
           }
-          # Who to notify on failure: the configured people, plus (optionally) the
-          # authors of the commits in this promotion. Bots are left out.
-          PEOPLE="$NOTIFY_USERS"
-          if [[ "$NOTIFY_COMMIT_AUTHORS" == "true" ]]; then
-            PEOPLE="$PEOPLE $(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" \
-              -q '[.commits[].author.login // empty | select(endswith("[bot]") | not)] | unique | .[]' 2>/dev/null | tr '\n' ' ')"
-          fi
-          MENTIONS=""
-          for u in $(echo "$PEOPLE" | tr ' ' '\n' | sed 's/^@//' | sort -u); do MENTIONS="$MENTIONS @$u"; done
 
           sleep 20   # let the queued build appear and set its description
           if OUT=$(wait_for_jenkins "$JENKINS_JOB" "$SHA" 330 promotion); then
