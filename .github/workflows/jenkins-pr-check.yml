@@ -86,6 +86,21 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"   # clean folder: no leftover git checkout here
+          # notify_jenkins: tell Jenkins the repo changed (open endpoint, no token).
+          # Jenkins re-checks the repo once and builds only if it finds a new commit.
+          # GitHub needs a few seconds to recompute a PR's merge preview, so the first
+          # notification can arrive too early; the wait loop repeats it until a build
+          # appears.
+          notify_jenkins() {
+            local payload code
+            payload=$(jq -n --arg u "https://github.com/$REPO" \
+              '{repository:{url:$u,html_url:$u,clone_url:($u+".git")},pusher:{name:"github-actions"}}')
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${JENKINS_URL%/}/github-webhook/" \
+              -H "Content-Type: application/json" -H "X-GitHub-Event: push" --data "$payload")
+            echo "Jenkins notified: HTTP $code"
+            [[ "$code" == "200" ]]
+          }
+
           # wait_for_jenkins <job> <key> <max-minutes> <mode>
           # zephyr-test runs PRs and the nightly, so a build is matched by its
           # description "<mode> <key>". For a PR the key is "PR#<number>", because
@@ -95,7 +110,7 @@ jobs:
           # prints its pass-rate line, and returns 0 for SUCCESS, 1 otherwise.
           # Uses only anonymous read access to Jenkins (no token).
           wait_for_jenkins() {
-            local job="$1" sha="$2" max_min="$3" mode="$4" api build result url line
+            local job="$1" sha="$2" max_min="$3" mode="$4" api build result url line tries=0
             api="${JENKINS_URL%/}/job/${job}/api/json?tree=builds%5Bnumber,result,building,url,description%5D%7B0,60%7D"
             for _ in $(seq 1 $((max_min * 2))); do
               build=$(curl -sf "$api" | jq -c --arg s "$sha" --arg m "$mode" \
@@ -117,7 +132,11 @@ jobs:
                 fi
                 echo "Jenkins build running: $url"
               else
-                echo "Waiting for Jenkins to start a build of $job for commit ${sha:0:12}..."
+                echo "Waiting for Jenkins to start a build of $job for ${sha:0:12}..."
+                tries=$((tries + 1))
+                # Re-notify every 2 minutes: the first notification can reach Jenkins
+                # before GitHub has published the new commit to test.
+                if (( tries % 4 == 0 )); then notify_jenkins || true; fi
               fi
               sleep 30
             done
@@ -129,13 +148,8 @@ jobs:
           [[ "$PR_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: invalid commit"; exit 1; }
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid PR number"; exit 1; }
 
-          # 1. Tell Jenkins the repo changed (open endpoint, no token)
-          REPO_URL="https://github.com/$REPO"
-          PAYLOAD=$(jq -n --arg u "$REPO_URL" '{repository:{url:$u,html_url:$u,clone_url:($u+".git")},pusher:{name:"github-actions"}}')
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${JENKINS_URL%/}/github-webhook/" \
-            -H "Content-Type: application/json" -H "X-GitHub-Event: push" --data "$PAYLOAD")
-          echo "Jenkins notified: HTTP $CODE"
-          [[ "$CODE" == "200" ]] || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
+          # 1. Tell Jenkins the repo changed
+          notify_jenkins || { echo "ERROR: Jenkins did not accept the notification"; exit 1; }
 
           # 2. Wait for the Jenkins build of this PR; pass/fail with it
           echo "PR #$PR_NUMBER, head commit ${PR_SHA:0:12}"
