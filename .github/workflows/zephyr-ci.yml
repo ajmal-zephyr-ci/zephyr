@@ -9,19 +9,21 @@ name: Zephyr CI
 #          no credential for that server, and one gate means one answer.
 #
 #   The weekly promotion (timer, or run by hand)
-#       -> Jenkins already ran the weekly board tests on ITS OWN timer, exactly
-#          like the nightly. This workflow only reads that result. If it failed,
-#          NO pull request is opened at all. If it passed, it opens the
-#          promotion PR as the GitHub App, waits for the repository's own
-#          checks, and merges.
+#       -> this workflow starts the weekly board tests in Jenkins and waits for
+#          that exact build. If it failed, NO pull request is opened at all. If
+#          it passed, and next is still on the commit that was tested, it opens
+#          the promotion PR as the GitHub App, waits for the repository's own
+#          checks, and merges. One timer, and no guessing which build was meant.
 #
 # Nothing is pushed to Jenkins for the weekly run, and Jenkins needs no GitHub
 # credential: the runner reads Jenkins (read-only) and acts on GitHub.
 
 on:
+  # Any target branch: a pull request anywhere in this repository gets board
+  # tests. Jenkins fetches that pull request's merge preview, which is its code
+  # combined with whatever branch it is aimed at, so nothing here depends on
+  # which branch that is.
   pull_request_target:
-    branches:
-      - v4.4.0-ti-next
     types: [opened, synchronize, reopened]
   schedule:
     - cron: '30 0 * * 1'      # 00:30 UTC Monday = 06:00 IST Monday
@@ -48,6 +50,10 @@ jobs:
       REPO: ${{ github.repository }}
       PR_SHA: ${{ github.event.pull_request.head.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      NEXT_BRANCH: v4.4.0-ti-next
+      MAIN_BRANCH: main-vi-next
     steps:
       - name: Ask Jenkins to test this pull request and wait
         shell: bash
@@ -57,6 +63,15 @@ jobs:
           [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
           [[ "$PR_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: invalid commit"; exit 1; }
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid PR number"; exit 1; }
+
+          # The weekly promotion pull request is next -> main, and Jenkins has
+          # already tested exactly that code hours earlier. Testing it again
+          # would spend another board run on the same commit.
+          if [[ "$PR_HEAD_REF" == "$NEXT_BRANCH" && "$PR_BASE_REF" == "$MAIN_BRANCH" ]]; then
+            echo "This is the weekly promotion pull request; its board tests already ran."
+            echo "### Board tests already ran for this commit (weekly promotion)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           JOB_PATH="job/${JENKINS_JOB//\//\/job\/}"
           JOB_SHORT="${JENKINS_JOB##*/}"
@@ -205,11 +220,37 @@ jobs:
           HEAD_SHA=$(gh api "repos/$REPO/branches/$NEXT_BRANCH" -q .commit.sha)
           echo "$NEXT_BRANCH is $AHEAD commits ahead, head ${HEAD_SHA:0:12}"
 
-          # --- 2. read the weekly board result Jenkins already produced --------
-          # Jenkins runs the weekly tests on its own timer, exactly like the
-          # nightly. We only read the newest finished build of that job.
-          B=$(curl -sf "${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bnumber,result,building,timestamp,url,description%5D%7B0,30%7D" \
-            | jq -c '[.builds[] | select(.building == false)] | first // {}' || echo '{}')
+          # --- 2. start the weekly board tests and wait for THAT build ---------
+          # GitHub starts the run itself, so there is no guessing which build was
+          # meant: the build number is the first one above the number that
+          # existed before we asked. Jenkins needs no timer of its own.
+          api="${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bnumber,result,building,url,description%5D%7B0,30%7D"
+          BEFORE=$(curl -sf "${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=nextBuildNumber" \
+            | jq -r '.nextBuildNumber // 0')
+          echo "Next Jenkins build number will be $BEFORE"
+
+          jar=$(mktemp)
+          cj=$(curl -sf -c "$jar" "${JENKINS_URL%/}/crumbIssuer/api/json" || true)
+          cf=$(echo "$cj" | jq -r '.crumbRequestField // empty' 2>/dev/null || true)
+          cr=$(echo "$cj" | jq -r '.crumb // empty' 2>/dev/null || true)
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jar" -c "$jar" \
+            ${cf:+-H "$cf: $cr"} "${JENKINS_URL%/}/${JOB_PATH}/buildWithParameters")
+          rm -f "$jar"
+          [[ "$code" == "201" || "$code" == "200" || "$code" == "302" ]] \
+            || { echo "ERROR: Jenkins refused to start the weekly tests (HTTP $code)"; exit 1; }
+          echo "Weekly board tests requested: HTTP $code"
+
+          B='{}'
+          for _ in $(seq 1 660); do
+            B=$(curl -sf "$api" | jq -c --argjson n "${BEFORE:-0}" \
+                  '[.builds[] | select(.number >= $n and ((.description // "") | startswith("promotion ")))] | first // {}') || B='{}'
+            [[ "$(echo "$B" | jq -r '.number // "none"')" == "none" ]] \
+              && { echo "Waiting for Jenkins to start the weekly build..."; sleep 30; continue; }
+            [[ "$(echo "$B" | jq -r '.building')" == "false" ]] && break
+            echo "Weekly board tests running: $(echo "$B" | jq -r .url)"
+            sleep 30
+          done
+
           J_RESULT=$(echo "$B" | jq -r '.result // "NONE"')
           J_URL=$(echo "$B" | jq -r '.url // ""')
           J_DESC=$(echo "$B" | jq -r '.description // ""')
@@ -219,10 +260,15 @@ jobs:
           echo "Jenkins weekly build: ${J_RESULT}, tested ${J_SHA:0:12}"
           echo "${LINES:-(no board result lines)}"
 
+          # Re-read next's head AFTER the tests: it may have moved during the hour.
+          HEAD_SHA=$(gh api "repos/$REPO/branches/$NEXT_BRANCH" -q .commit.sha)
+
           FAIL_REASON=""
           if [[ "$J_RESULT" != "SUCCESS" ]]; then
             FAIL_REASON="the weekly board tests reported $J_RESULT"
           elif [[ "$J_SHA" != "$HEAD_SHA" ]]; then
+            # next moved while the boards were running, so what was tested is not
+            # what would be merged.
             FAIL_REASON="Jenkins tested ${J_SHA:0:12} but $NEXT_BRANCH is now at ${HEAD_SHA:0:12}"
           fi
 
