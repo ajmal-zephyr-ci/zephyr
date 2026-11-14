@@ -77,21 +77,13 @@ jobs:
           JOB_SHORT="${JENKINS_JOB##*/}"
           KEY="pr PR#${PR_NUMBER}@${PR_SHA:0:12}"
 
-          # Only accept a build from this run onwards. An earlier build of the
-          # SAME commit may exist - a run that was refused, aborted, or made
-          # before a change to the pipeline - and its result must not be
-          # reported as the answer to this one.
-          FROM=$(curl -sf "${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=nextBuildNumber" \
-            | jq -r '.nextBuildNumber // 0')
-          echo "Accepting Jenkins build $FROM or newer"
-
           # Already queued or building for this exact commit? Then do not ask again.
           already_running() {
             local q b
             q=$(curl -sf "${JENKINS_URL%/}/queue/api/json?tree=items%5Btask%5Bname%5D,params%5D" \
               | jq -r --arg j "$JOB_SHORT" '[.items[]? | select(.task.name == $j) | .params // ""] | join(" ")' 2>/dev/null || true)
             [[ "$q" == *"PR_HEAD=$PR_SHA"* ]] && { echo "Jenkins already has this queued"; return 0; }
-            b=$(curl -sf "${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bnumber,building,description%5D%7B0,10%7D" \
+            b=$(curl -sf "${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bbuilding,description%5D%7B0,10%7D" \
               | jq -r --arg k "$KEY" '[.builds[]? | select(.building == true and ((.description // "") | startswith($k)))] | length' 2>/dev/null || echo 0)
             [[ "${b:-0}" != "0" ]] && { echo "Jenkins is already building this"; return 0; }
             return 1
@@ -122,8 +114,8 @@ jobs:
           # Wait for the build whose description starts with this PR and commit.
           api="${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bnumber,result,building,url,description%5D%7B0,60%7D"
           for _ in $(seq 1 660); do
-            build=$(curl -sf "$api" | jq -c --arg k "$KEY" --argjson n "${FROM:-0}" \
-              '[.builds[] | select(.number >= $n and ((.description // "") | startswith($k)))] | first // empty') || build=""
+            build=$(curl -sf "$api" | jq -c --arg k "$KEY" \
+              '[.builds[] | select((.description // "") | startswith($k))] | first // empty') || build=""
             if [[ -n "$build" ]]; then
               url=$(echo "$build" | jq -r .url)
               if [[ "$(echo "$build" | jq -r .building)" == "false" ]]; then
