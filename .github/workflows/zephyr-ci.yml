@@ -1,0 +1,295 @@
+name: Zephyr CI
+
+# ONE workflow, two jobs, two situations:
+#
+#   A pull request into the development branch
+#       -> ask Jenkins to test it, wait, pass or fail the check with the board
+#          result. Whether the author is allowed to use a board is decided by
+#          Jenkins alone, from a list in the internal repository: the runner has
+#          no credential for that server, and one gate means one answer.
+#
+#   The weekly promotion (timer, or run by hand)
+#       -> Jenkins already ran the weekly board tests on ITS OWN timer, exactly
+#          like the nightly. This workflow only reads that result. If it failed,
+#          NO pull request is opened at all. If it passed, it opens the
+#          promotion PR as the GitHub App, waits for the repository's own
+#          checks, and merges.
+#
+# Nothing is pushed to Jenkins for the weekly run, and Jenkins needs no GitHub
+# credential: the runner reads Jenkins (read-only) and acts on GitHub.
+
+on:
+  pull_request_target:
+    branches:
+      - v4.4.0-ti-next
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '30 0 * * 1'      # 00:30 UTC Monday = 06:00 IST Monday
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zephyr-ci-${{ github.event.pull_request.number || github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+jobs:
+
+  # --------------------------------------------------------- PR board tests --
+  pr-board-test:
+    name: Board tests on hardware (Jenkins)
+    if: github.event_name == 'pull_request_target'
+    runs-on: [self-hosted, linux, x64, jenkins-internal]
+    timeout-minutes: 360
+    env:
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      JENKINS_JOB: Zephyr/Zephyr_Test_Pipeline
+      REPO: ${{ github.repository }}
+      PR_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Ask Jenkins to test this pull request and wait
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
+          [[ "$PR_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: invalid commit"; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid PR number"; exit 1; }
+
+          JOB_PATH="job/${JENKINS_JOB//\//\/job\/}"
+          JOB_SHORT="${JENKINS_JOB##*/}"
+          KEY="pr PR#${PR_NUMBER}@${PR_SHA:0:12}"
+
+          # Already queued or building for this exact commit? Then do not ask again.
+          already_running() {
+            local q b
+            q=$(curl -sf "${JENKINS_URL%/}/queue/api/json?tree=items%5Btask%5Bname%5D,params%5D" \
+              | jq -r --arg j "$JOB_SHORT" '[.items[]? | select(.task.name == $j) | .params // ""] | join(" ")' 2>/dev/null || true)
+            [[ "$q" == *"PR_HEAD=$PR_SHA"* ]] && { echo "Jenkins already has this queued"; return 0; }
+            b=$(curl -sf "${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bbuilding,description%5D%7B0,10%7D" \
+              | jq -r --arg k "$KEY" '[.builds[]? | select(.building == true and ((.description // "") | startswith($k)))] | length' 2>/dev/null || echo 0)
+            [[ "${b:-0}" != "0" ]] && { echo "Jenkins is already building this"; return 0; }
+            return 1
+          }
+
+          # Start the Jenkins job directly. The CSRF crumb is tied to a session,
+          # so the crumb request and the build request share a cookie jar.
+          start_jenkins() {
+            local json crumb field code jar
+            already_running && return 0
+            jar=$(mktemp)
+            json=$(curl -sf -c "$jar" "${JENKINS_URL%/}/crumbIssuer/api/json" || true)
+            field=$(echo "$json" | jq -r '.crumbRequestField // empty' 2>/dev/null || true)
+            crumb=$(echo "$json" | jq -r '.crumb // empty' 2>/dev/null || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$jar" -c "$jar" \
+              ${field:+-H "$field: $crumb"} \
+              "${JENKINS_URL%/}/${JOB_PATH}/buildWithParameters?MODE=pr&PR_NUMBER=${PR_NUMBER}&PR_HEAD=${PR_SHA}")
+            rm -f "$jar"
+            [[ "$code" == "201" || "$code" == "200" || "$code" == "302" ]] \
+              && { echo "Jenkins build requested: HTTP $code"; return 0; }
+            echo "ERROR: Jenkins refused the request (HTTP $code)"; return 1
+          }
+
+          start_jenkins || exit 1
+          echo "PR #$PR_NUMBER, head commit ${PR_SHA:0:12}"
+          sleep 20
+
+          # Wait for the build whose description starts with this PR and commit.
+          api="${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bnumber,result,building,url,description%5D%7B0,60%7D"
+          for _ in $(seq 1 660); do
+            build=$(curl -sf "$api" | jq -c --arg k "$KEY" \
+              '[.builds[] | select((.description // "") | startswith($k))] | first // empty') || build=""
+            if [[ -n "$build" ]]; then
+              url=$(echo "$build" | jq -r .url)
+              if [[ "$(echo "$build" | jq -r .building)" == "false" ]]; then
+                result=$(echo "$build" | jq -r .result)
+                line=$(curl -sf "${url}consoleText" | grep -o 'BOARD_RESULT: .*' || true)
+                echo "Jenkins result: $result"
+                # NOT_BUILT means Jenkins refused this PR (author not on the list)
+                [[ "$result" == "NOT_BUILT" ]] && echo "Jenkins did not run the board tests for this pull request."
+                echo "${line:-(no board result lines)}"
+                { echo "### Board tests: $result"; echo '```';
+                  echo "${line:-}" | sed 's# job=[^ ]* build=[0-9]*##'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+                [[ "$result" == "SUCCESS" ]]
+                exit
+              fi
+              echo "Jenkins build running: $url"
+            else
+              echo "Waiting for Jenkins to start a build for $KEY..."
+            fi
+            sleep 30
+          done
+          echo "ERROR: no finished Jenkins build for $KEY within 330 minutes"
+          exit 1
+
+  # ------------------------------------------------------- weekly promotion --
+  promotion:
+    name: Weekly promotion (read Jenkins, then merge)
+    if: github.event_name != 'pull_request_target'
+    runs-on: [self-hosted, linux, x64, jenkins-internal]
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      JENKINS_URL: ${{ secrets.JENKINS_URL }}
+      APP_ID: ${{ secrets.PROMOTION_APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.PROMOTION_APP_PRIVATE_KEY }}
+      # Plain settings, kept here rather than as repository variables: they are
+      # not secret, and changing them goes through a reviewed pull request.
+      JENKINS_JOB: Zephyr/Zephyr_Promotion_Pipeline
+      NEXT_BRANCH: v4.4.0-ti-next
+      MAIN_BRANCH: main-vi-next
+      REQUIRE_PR_CHECKS: 'true'
+      PR_CHECKS_TIMEOUT_MIN: '120'
+    steps:
+      - name: Read the weekly board result, then open and merge the promotion PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          [[ -n "$JENKINS_URL" ]] || { echo "ERROR: secret JENKINS_URL is not set"; exit 1; }
+          JOB_PATH="job/${JENKINS_JOB//\//\/job\/}"
+          WEEK=$(date +%G-W%V)
+
+          # --- act as the GitHub App, so the PR's own checks start -------------
+          use_app_identity() {
+            if [[ -z "${APP_ID:-}" || -z "${APP_PRIVATE_KEY:-}" ]]; then
+              echo "GitHub App secrets not set - using the built-in workflow key"; return 0
+            fi
+            local now hdr pay sig jwt inst tok keyfile
+            b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            keyfile=$(mktemp); printf '%s\n' "$APP_PRIVATE_KEY" > "$keyfile"
+            now=$(date +%s)
+            hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+            pay=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$APP_ID" | b64url)
+            sig=$(printf '%s.%s' "$hdr" "$pay" | openssl dgst -sha256 -sign "$keyfile" | b64url)
+            rm -f "$keyfile"
+            jwt="$hdr.$pay.$sig"
+            inst=$(curl -sf -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/installation" | jq -r '.id // empty') \
+              || { echo "ERROR: the GitHub App is not installed on $REPO"; exit 1; }
+            tok=$(curl -sf -X POST -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/app/installations/$inst/access_tokens" | jq -r '.token // empty')
+            [[ -n "$tok" ]] || { echo "ERROR: could not get a GitHub App key"; exit 1; }
+            echo "::add-mask::$tok"; export GH_TOKEN="$tok"
+            echo "Using the GitHub App identity"
+          }
+
+          # Who to tell when a promotion is blocked: the authors of the commits
+          # being promoted. They are the people who can fix it, and the list
+          # needs no maintenance.
+          notify_list() {
+            local m=""
+            for u in $(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" \
+                -q '[.commits[].author.login // empty | select(endswith("[bot]") | not)] | unique | .[]' 2>/dev/null); do
+              m="$m @$u"
+            done
+            printf '%s' "$m"
+          }
+
+          use_app_identity
+
+          # --- 1. is there anything to promote? --------------------------------
+          AHEAD=$(gh api "repos/$REPO/compare/$MAIN_BRANCH...$NEXT_BRANCH" -q .ahead_by)
+          if [[ "$AHEAD" == "0" ]]; then
+            echo "$NEXT_BRANCH has nothing new for $MAIN_BRANCH - nothing to promote"
+            echo "### Nothing to promote this week" >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          HEAD_SHA=$(gh api "repos/$REPO/branches/$NEXT_BRANCH" -q .commit.sha)
+          echo "$NEXT_BRANCH is $AHEAD commits ahead, head ${HEAD_SHA:0:12}"
+
+          # --- 2. read the weekly board result Jenkins already produced --------
+          # Jenkins runs the weekly tests on its own timer, exactly like the
+          # nightly. We only read the newest finished build of that job.
+          B=$(curl -sf "${JENKINS_URL%/}/${JOB_PATH}/api/json?tree=builds%5Bnumber,result,building,timestamp,url,description%5D%7B0,30%7D" \
+            | jq -c '[.builds[] | select(.building == false)] | first // {}' || echo '{}')
+          J_RESULT=$(echo "$B" | jq -r '.result // "NONE"')
+          J_URL=$(echo "$B" | jq -r '.url // ""')
+          J_DESC=$(echo "$B" | jq -r '.description // ""')
+          J_SHA=$(echo "$J_DESC" | awk '{print $NF}')
+          LINES=""
+          [[ -n "$J_URL" ]] && LINES=$(curl -sf "${J_URL}consoleText" | grep -o 'BOARD_RESULT: .*' || true)
+          echo "Jenkins weekly build: ${J_RESULT}, tested ${J_SHA:0:12}"
+          echo "${LINES:-(no board result lines)}"
+
+          FAIL_REASON=""
+          if [[ "$J_RESULT" != "SUCCESS" ]]; then
+            FAIL_REASON="the weekly board tests reported $J_RESULT"
+          elif [[ "$J_SHA" != "$HEAD_SHA" ]]; then
+            FAIL_REASON="Jenkins tested ${J_SHA:0:12} but $NEXT_BRANCH is now at ${HEAD_SHA:0:12}"
+          fi
+
+          # --- 3. board tests failed: no pull request at all -------------------
+          if [[ -n "$FAIL_REASON" ]]; then
+            echo "NOT promoting: $FAIL_REASON"
+            { echo "### Promotion $WEEK stopped: $FAIL_REASON";
+              echo '```'; echo "${LINES:-}" | sed 's# job=[^ ]* build=[0-9]*##'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # --- 4. open (or reuse) the promotion PR as the App ------------------
+          OWNER="${REPO%%/*}"
+          PR=$(gh api "repos/$REPO/pulls?state=open&base=$MAIN_BRANCH&head=$OWNER:$NEXT_BRANCH" -q '.[0].number // empty')
+          if [[ -z "$PR" ]]; then
+            PR=$(gh api -X POST "repos/$REPO/pulls" \
+              -f title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH" \
+              -f head="$NEXT_BRANCH" -f base="$MAIN_BRANCH" \
+              -f body="$(printf 'Automatic weekly promotion.\n\nThe board tests already passed on %s:\n\n```\n%s\n```\n\nAfter merging, do NOT delete the source branch (%s).\n' "${J_SHA:0:12}" "$(echo "${LINES:-}" | sed 's# job=[^ ]* build=[0-9]*##')" "$NEXT_BRANCH")" \
+              -q .number)
+          fi
+          echo "Promotion PR: #$PR"
+
+          # --- 5. can it merge at all? ----------------------------------------
+          MERGEABLE=""
+          for _ in $(seq 1 10); do
+            MERGEABLE=$(gh api "repos/$REPO/pulls/$PR" -q '.mergeable_state // ""')
+            [[ "$MERGEABLE" != "unknown" && -n "$MERGEABLE" ]] && break
+            sleep 6
+          done
+          if [[ "$MERGEABLE" == "dirty" ]]; then
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$(printf '**Weekly promotion %s: NOT merged - %s and %s have conflicting changes.**%s\n\nThe board tests passed; the conflict has to be resolved before this can merge.\n' "$WEEK" "$NEXT_BRANCH" "$MAIN_BRANCH" "$(notify_list | sed 's/^/ cc/')")" >/dev/null
+            echo "### Promotion $WEEK NOT merged: merge conflict (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"; exit 1
+          fi
+
+          # --- 6. wait for the repository's own checks ------------------------
+          if [[ "$REQUIRE_PR_CHECKS" == "true" ]]; then
+            echo "Waiting for the PR checks on #$PR..."
+            START=$(date +%s); OK=""
+            while :; do
+              NOW=$(date +%s)
+              (( NOW - START > 2400 )) && { use_app_identity; START=$((START + 2400)); }
+              RUNS=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+                -q ".check_runs[] | select(any(.pull_requests[]?; .number == $PR)) | {name, status, conclusion}" | jq -s '.')
+              TOTAL=$(echo "$RUNS" | jq 'length')
+              PENDING=$(echo "$RUNS" | jq '[.[] | select(.status != "completed")] | length')
+              FAILED=$(echo "$RUNS" | jq -r '.[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not)) | "CHECK: \(.name): \(.conclusion)"')
+              if [[ -n "$FAILED" ]]; then
+                echo "$FAILED"
+                gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$(printf '**Weekly promotion %s: NOT merged - board tests passed, but PR checks did not.**%s\n\n```\n%s\n```\n' "$WEEK" "$(notify_list | sed 's/^/ cc/')" "$FAILED")" >/dev/null
+                echo "### Promotion $WEEK NOT merged: PR checks failed (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"; exit 1
+              fi
+              if (( TOTAL > 0 && PENDING == 0 )); then OK="all $TOTAL PR checks passed (or were skipped)"; break; fi
+              if (( NOW - START > PR_CHECKS_TIMEOUT_MIN * 60 )); then
+                echo "PR checks still running after $PR_CHECKS_TIMEOUT_MIN minutes"
+                echo "### Promotion $WEEK NOT merged: PR checks timed out (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"; exit 1
+              fi
+              echo "Waiting for PR checks: $PENDING of $TOTAL still running..."
+              sleep 30
+            done
+            echo "$OK"
+          fi
+
+          # --- 7. merge --------------------------------------------------------
+          use_app_identity
+          gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$(printf '**Weekly promotion %s: board tests and PR checks passed - merging.**\n\n```\n%s\n```\n' "$WEEK" "$(echo "${LINES:-}" | sed 's# job=[^ ]* build=[0-9]*##')")" >/dev/null
+          gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=merge \
+            -f commit_title="Weekly promotion $WEEK: $NEXT_BRANCH -> $MAIN_BRANCH (#$PR)" >/dev/null
+          echo "Merged PR #$PR into $MAIN_BRANCH"
+          echo "### Promotion $WEEK merged (PR #$PR)" >> "$GITHUB_STEP_SUMMARY"
